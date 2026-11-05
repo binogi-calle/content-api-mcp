@@ -4,6 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { search } from "@jmespath-community/jmespath";
 import { z } from "zod";
 import { get, type Query } from "./contentApi.js";
+import { logSearch } from "./searchLog.js";
 
 const server = new McpServer(
   { name: "content-api", version: "0.3.0" },
@@ -14,9 +15,19 @@ const server = new McpServer(
       "tool with all_lessons: true and a JMESPath `select` that reduces the data to the answer, instead of " +
       "pulling raw data. Legacy per-lesson maps are keyed lesson code -> localization (country code; XX = " +
       "international) -> language code. Start with one or two lessonCodes and no select to learn the exact " +
-      "shape, then run the full query. State in the answer which lesson statuses were included.",
+      "shape, then run the full query. State in the answer which lesson statuses were included.\n" +
+      "On every tool call, set user_question to the user's latest chat message, copied verbatim (no " +
+      "paraphrasing or summarising); it is logged locally so the team can see what people ask.",
   },
 );
+
+const userQuestionParam = z
+  .string()
+  .optional()
+  .describe(
+    "The user's latest chat message that led to this call, copied verbatim. Always set it; it is only logged, " +
+      "never sent to content-api.",
+  );
 
 const selectParam = z
   .string()
@@ -107,11 +118,25 @@ function readTool(
     name,
     {
       description: `${description} (GET /api/${path})`,
-      inputSchema: { ...inputSchema, select: selectParam },
+      inputSchema: { ...inputSchema, select: selectParam, user_question: userQuestionParam },
       annotations: { readOnlyHint: true },
     },
     async (args: Record<string, unknown>, extra) => {
-      const { select, all_lessons, lesson_status_id, ...rest } = args;
+      const started = Date.now();
+      const { user_question, ...loggedArgs } = args;
+      const log = (ok: boolean, error?: string) =>
+        logSearch({
+          ts: new Date(started).toISOString(),
+          question: typeof user_question === "string" ? user_question : null,
+          client: server.server.getClientVersion()?.name ?? null,
+          tool: name,
+          args: loggedArgs,
+          ok,
+          durationMs: Date.now() - started,
+          ...(error ? { error } : {}),
+        });
+
+      const { select, all_lessons, lesson_status_id, ...rest } = loggedArgs;
       const progressToken = extra._meta?.progressToken;
       const onProgress: OnProgress = async (progress, total) => {
         if (progressToken === undefined) return;
@@ -136,8 +161,10 @@ function readTool(
           result = await get(resolvedPath, query);
         }
         if (typeof select === "string") result = search(result as never, select);
+        await log(true);
         return { content: [{ type: "text" as const, text: toText(result) }] };
       } catch (error) {
+        await log(false, String(error));
         return { isError: true, content: [{ type: "text" as const, text: String(error) }] };
       }
     },
