@@ -85,33 +85,57 @@ After changing `src/`, run `npm run build` and restart the client (quit and reop
 
 ## Questions across all lessons
 
-Most interesting questions span every lesson (about 1,500 on QA). That's far more data than a single tool result can hold. Two parameters let Claude answer them anyway:
+Most interesting questions span every lesson (about 1,500 on QA). That's far more data than a single tool result can hold. Claude answers them in one of two ways.
 
-- **`all_lessons: true`** makes the server look up every lesson code and query content-api in batches (25 lessons per request, 3 requests at a time). It works on `legacy_get_lesson_titles`, `legacy_get_lesson_icon_urls`, `legacy_get_lesson_subtitle_urls` and `legacy_get_lesson_videos`. Full lessons and quizzes are too heavy to scan (about 1 GB in total), so those tools only take explicit lesson codes. `lesson_status_id` picks drafts (`1`) or published lessons (`2`, the default).
-- **`select`** (on every tool) is a [JMESPath](https://jmespath.org) expression the server applies before returning the result. Only the answer goes back to Claude, not megabytes of raw data. JMESPath only reshapes data; it can't make requests.
+### First choice: `get_content_coverage`
 
-The legacy per-lesson data is keyed by lesson code, then localization (country code; `XX` = international), then language: `{"BAE1985": {"DE": {"de": {...}}, "XX": {"en": {...}}}}`. Useful expressions for `legacy_get_lesson_subtitle_urls` (or `_videos` / `_titles`):
+`GET /api/lessons/content-coverage` is a content-api endpoint built for this MCP. One call returns, for every lesson:
+
+- `status_id`
+- `catalogs`: the countries whose catalog visibly lists the lesson, with subject names
+- `totals`: quiz questions, concepts, learning outcomes, video
+- `parts`: title, description, video, subtitle, transcript, quiz_text, concept and learning_outcome, each as `{localization: {language: [count, proofread]}}`. `proofread` is set only for subtitles. `video` counts mp4 and m3u8 files, so 2 per language.
+
+The response also has `generated_at` (content-api caches it for up to 15 minutes) and `rules.catalog_targets`, which localization and language each country's catalog lists lessons by. On QA the call takes about 5 seconds, against about 2 minutes for a cold legacy scan.
+
+The tool filters by `lesson_status` (`published` by default, `draft` or `all`), then applies `select` to the lessons map `{code: lesson}`. Without `select`, it returns the shape, the rules and one example lesson instead of 7 MB of data. Examples:
 
 | Question | `select` |
 | --- | --- |
-| Lessons with German subtitles | ``length(values(@)[?length(values(@)[?de]) > `0`])`` |
-| Which lessons those are | ``items(@)[?length(values(@[1])[?de]) > `0`] \| map(&@[0], @)`` |
-| Only in the German (`DE`) localization | `length(values(@)[?DE.de])` |
-| German subtitles not yet proofread | ``length(values(@)[?length(values(@)[?de && de.hasBeenProofread == `false`]) > `0`])`` |
-| Total lessons scanned | `length(keys(@))` |
+| Lessons with German subtitles | ``length(values(@)[?length(values(parts.subtitle \|\| `{}`)[?de]) > `0`])`` |
+| …in the German (`DE`) localization | `length(values(@)[?parts.subtitle.DE.de])` |
+| …with German subtitles not fully proofread | ``length(values(@)[?length(values(parts.subtitle \|\| `{}`)[?de && de[1] < de[0]]) > `0`])`` |
+| In the SE catalog but missing an SE/sv title (codes) | `items(@)[?@[1].catalogs.SE && !(@[1].parts.title.SE.sv)] \| map(&@[0], @)` |
+| Swedish quiz text incomplete | ``length(values(@)[?totals.quiz_questions > `0` && (parts.quiz_text.XX.sv[0] \|\| `0`) < totals.quiz_questions])`` |
 
-Swap `de` for any language code (`sv`, `en`, `fr`, …).
+Swap `de` / `sv` for any language code. Two JMESPath gotchas:
+- Guard parts a lesson may lack with ``|| `{}` ``.
+- Put negated paths in parentheses: `!(parts.title.SE.sv)`. Without them, `!parts.title.SE.sv` negates only `parts` and silently matches nothing.
 
-**Speed:** content-api caches lessons, so a scan of lessons it hasn't cached takes about 2 minutes on QA, and a cached scan takes seconds. This server also caches every response in memory for 10 minutes, so follow-up questions in the same session are instant. Restart the server to clear its cache. Long scans send a progress update after each batch, so clients that support it don't time out.
+The coverage data has counts only, with no URLs or text. Questions about actual content (subtitle URLs, title text, quiz questions) go to the other tools.
 
-**Large results:** results are compact JSON, cut off at 90,000 characters to fit client limits. A truncated result starts with a note telling Claude how to narrow the request.
+### Fallback: legacy scans
+
+If `get_content_coverage` fails, for example in an environment that doesn't have the endpoint yet, its error tells Claude to switch to the legacy tools:
+
+- **`all_lessons: true`** makes the server look up every lesson code and query content-api in batches (25 lessons per request, 3 requests at a time). It works on `legacy_get_lesson_titles`, `legacy_get_lesson_icon_urls`, `legacy_get_lesson_subtitle_urls` and `legacy_get_lesson_videos`. Full lessons and quizzes are too heavy to scan (about 1 GB in total), so those tools only take explicit lesson codes. `lesson_status_id` picks drafts (`1`) or published lessons (`2`, the default).
+- **`select`** works as above, on the merged legacy map. That map is keyed by lesson code, then localization (`XX` = international), then language: `{"BAE1985": {"DE": {"de": {...}}}}`. For example, ``length(values(@)[?length(values(@)[?de]) > `0`])`` counts lessons with German subtitles in `legacy_get_lesson_subtitle_urls`.
+
+A cold legacy scan takes about 2 minutes on QA and sends a progress update after each batch, so clients that support it don't time out. On QA, both paths gave the same answers when checked on 2026-11-05: lessons with German subtitles (1,257), those in `DE` (1,213), those not fully proofread (61), and lessons with German video (1,211).
+
+### Caching and large results
+
+This server caches every content-api response in memory for 10 minutes, so follow-up questions in the same session are instant. Restart the server to clear its cache.
+
+Results are compact JSON, cut off at 90,000 characters to fit client limits. A truncated result starts with a note telling Claude how to narrow the request.
 
 ## Tools
 
-All 30 tools are read-only and map 1:1 to content-api GET endpoints. Every tool also accepts `select` and `user_question` (see [Question log](#question-log)).
+All 31 tools are read-only and map 1:1 to content-api GET endpoints. Every tool also accepts `select` and `user_question` (see [Question log](#question-log)).
 
 | Area | Tools |
 | --- | --- |
+| Coverage (all lessons, fast) | `get_content_coverage` |
 | Lessons | `list_lesson_codes`, `get_lesson`, `get_lesson_container` |
 | Lesson content | `get_concept`, `get_quiz`, `find_quizzes_by_lesson_codes`, `get_video`, `get_video_asset`, `get_video_asset_element`, `list_video_asset_elements` |
 | Learning outcomes | `get_learning_outcome`, `list_learning_outcome_assets`, `list_learning_outcome_types`, `get_learning_outcome_type` |

@@ -1,21 +1,30 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import { search } from "@jmespath-community/jmespath";
 import { z } from "zod";
 import { get, type Query } from "./contentApi.js";
 import { logSearch } from "./searchLog.js";
 
 const server = new McpServer(
-  { name: "content-api", version: "0.4.0" },
+  { name: "content-api", version: "0.5.0" },
   {
     instructions:
       "Read-only access to content-api. No tool can create, update or delete content.\n" +
-      "To answer questions across many lessons (counts, coverage, which lessons have X), call a legacy_* bulk " +
-      "tool with all_lessons: true and a JMESPath `select` that reduces the data to the answer, instead of " +
-      "pulling raw data. Legacy per-lesson maps are keyed lesson code -> localization (country code; XX = " +
-      "international) -> language code. Start with one or two lessonCodes and no select to learn the exact " +
-      "shape, then run the full query. State in the answer which lesson statuses were included.\n" +
+      "Questions across many lessons (counts, coverage, which lessons have or lack X): use get_content_coverage " +
+      "with a JMESPath `select`. It covers, per lesson, title, description, video, subtitle (with proofread " +
+      "counts), transcript, quiz text, concepts and learning outcomes per localization and language, plus totals " +
+      "and the catalogs/subjects the lesson is listed in, in one fast call. Call it once without select first " +
+      "to see the shape.\n" +
+      "Use the other tools for actual content and single lessons: URLs, title text, quiz questions, concept text, " +
+      "lesson details.\n" +
+      "Fallback: if get_content_coverage fails, or the question needs data it does not have, call a legacy_* bulk " +
+      "tool with all_lessons: true and a `select` instead (slower; per-lesson maps keyed lesson code -> " +
+      "localization -> language; try one or two lessonCodes without select first to learn the shape).\n" +
+      "Localization XX = international. State in the answer which lesson statuses were included, and for coverage " +
+      "answers how old the data is (generated_at).\n" +
       "On every tool call, set user_question to the user's latest chat message, copied verbatim (no " +
       "paraphrasing or summarising); it is logged locally so the team can see what people ask.",
   },
@@ -98,6 +107,55 @@ async function getForAllLessons(
   return merged;
 }
 
+type Extra = RequestHandlerExtra<ServerRequest, ServerNotification>;
+type Args = Record<string, unknown>;
+
+/**
+ * Register a read-only tool. Owns what every tool shares: the user_question
+ * parameter and question log, the generic `select` (unless the tool brings its
+ * own), the output cap, and turning errors into tool errors.
+ */
+function registerTool(
+  name: string,
+  description: string,
+  inputSchema: z.ZodRawShape,
+  run: (args: Args, extra: Extra) => Promise<unknown>,
+  { ownSelect = false }: { ownSelect?: boolean } = {},
+) {
+  server.registerTool(
+    name,
+    {
+      description,
+      inputSchema: { ...inputSchema, ...(ownSelect ? {} : { select: selectParam }), user_question: userQuestionParam },
+      annotations: { readOnlyHint: true },
+    },
+    async (args: Args, extra: Extra) => {
+      const started = Date.now();
+      const { user_question, ...toolArgs } = args;
+      const log = (ok: boolean, error?: string) =>
+        logSearch({
+          ts: new Date(started).toISOString(),
+          question: typeof user_question === "string" ? user_question : null,
+          client: server.server.getClientVersion()?.name ?? null,
+          tool: name,
+          args: toolArgs,
+          ok,
+          durationMs: Date.now() - started,
+          ...(error ? { error } : {}),
+        });
+      try {
+        let result = await run(toolArgs, extra);
+        if (!ownSelect && typeof toolArgs.select === "string") result = search(result as never, toolArgs.select);
+        await log(true);
+        return { content: [{ type: "text" as const, text: toText(result) }] };
+      } catch (error) {
+        await log(false, String(error));
+        return { isError: true, content: [{ type: "text" as const, text: String(error) }] };
+      }
+    },
+  );
+}
+
 type ToolOptions = { bulkLessons?: boolean };
 
 /**
@@ -114,62 +172,105 @@ function readTool(
   inputSchema: z.ZodRawShape = {},
   { bulkLessons = false }: ToolOptions = {},
 ) {
-  server.registerTool(
-    name,
-    {
-      description: `${description} (GET /api/${path})`,
-      inputSchema: { ...inputSchema, select: selectParam, user_question: userQuestionParam },
-      annotations: { readOnlyHint: true },
-    },
-    async (args: Record<string, unknown>, extra) => {
-      const started = Date.now();
-      const { user_question, ...loggedArgs } = args;
-      const log = (ok: boolean, error?: string) =>
-        logSearch({
-          ts: new Date(started).toISOString(),
-          question: typeof user_question === "string" ? user_question : null,
-          client: server.server.getClientVersion()?.name ?? null,
-          tool: name,
-          args: loggedArgs,
-          ok,
-          durationMs: Date.now() - started,
-          ...(error ? { error } : {}),
-        });
-
-      const { select, all_lessons, lesson_status_id, ...rest } = loggedArgs;
-      const progressToken = extra._meta?.progressToken;
-      const onProgress: OnProgress = async (progress, total) => {
-        if (progressToken === undefined) return;
-        await extra.sendNotification({
-          method: "notifications/progress",
-          params: { progressToken, progress, total, message: `Scanned batch ${progress} of ${total}` },
-        });
-      };
-      const query: Query = { ...(rest as Query) };
-      const resolvedPath = path.replace(/\{(\w+)\}/g, (_, key: string) => {
-        const value = query[key];
-        delete query[key];
-        return encodeURIComponent(String(value));
+  registerTool(name, `${description} (GET /api/${path})`, inputSchema, async (args, extra) => {
+    const { select: _select, all_lessons, lesson_status_id, ...rest } = args;
+    const progressToken = extra._meta?.progressToken;
+    const onProgress: OnProgress = async (progress, total) => {
+      if (progressToken === undefined) return;
+      await extra.sendNotification({
+        method: "notifications/progress",
+        params: { progressToken, progress, total, message: `Scanned batch ${progress} of ${total}` },
       });
-      try {
-        let result: unknown;
-        if (bulkLessons && all_lessons) {
-          result = await getForAllLessons(resolvedPath, query, lesson_status_id as number | undefined, onProgress);
-        } else if (bulkLessons && !query.lessonCodes) {
-          throw new Error("Pass lessonCodes, or all_lessons: true.");
-        } else {
-          result = await get(resolvedPath, query);
-        }
-        if (typeof select === "string") result = search(result as never, select);
-        await log(true);
-        return { content: [{ type: "text" as const, text: toText(result) }] };
-      } catch (error) {
-        await log(false, String(error));
-        return { isError: true, content: [{ type: "text" as const, text: String(error) }] };
-      }
-    },
-  );
+    };
+    const query: Query = { ...(rest as Query) };
+    const resolvedPath = path.replace(/\{(\w+)\}/g, (_, key: string) => {
+      const value = query[key];
+      delete query[key];
+      return encodeURIComponent(String(value));
+    });
+    if (bulkLessons && all_lessons) {
+      return getForAllLessons(resolvedPath, query, lesson_status_id as number | undefined, onProgress);
+    }
+    if (bulkLessons && !query.lessonCodes) throw new Error("Pass lessonCodes, or all_lessons: true.");
+    return get(resolvedPath, query);
+  });
 }
+
+// --- Content coverage (fast path for questions across all lessons) -----------
+
+type CoverageLesson = { status_id: number; [key: string]: unknown };
+type CoverageDocument = { generated_at: string; rules: unknown; lessons: Record<string, CoverageLesson> };
+
+const LESSON_STATUS_IDS = { published: [2], draft: [1], all: null } as const;
+
+registerTool(
+  "get_content_coverage",
+  "Content coverage for every lesson, in one fast call: the first choice for counts and \"which lessons have or " +
+    "lack X\" questions. Per lesson: status_id; catalogs ({country code: [subject names]} where it is visibly " +
+    "listed); totals {quiz_questions, concepts, learning_outcomes, video}; and parts {title, description, video, " +
+    "subtitle, transcript, quiz_text, concept, learning_outcome}, each {localization: {language: [count, " +
+    "proofread]}}. proofread is set only for subtitles (number proofread, compare with count). video counts mp4 " +
+    "and m3u8 files (2 per language). quiz_text / concept / learning_outcome counts compare with totals. " +
+    "rules.catalog_targets says which localization/language each country's catalog lists lessons by (SE->SE/sv, " +
+    "DE->DE/de, FI->FI/fi, others->XX/en). Server-cached up to 15 minutes; generated_at says when it was built. " +
+    "Has no URLs or text: use the other tools for those. If this tool fails, fall back to the legacy_* tools " +
+    "with all_lessons. (GET /api/lessons/content-coverage)",
+  {
+    lesson_status: z
+      .enum(["published", "draft", "all"])
+      .optional()
+      .describe("Which lessons to include (default: published)"),
+    select: z
+      .string()
+      .optional()
+      .describe(
+        "JMESPath applied to the lessons map {code: lesson} after the status filter. Omit once to see the shape " +
+          "and an example lesson. Guard missing parts with `|| `{}`` and wrap negated paths in parentheses: " +
+          "`!(parts.title.SE.sv)`, not `!parts.title.SE.sv` (the latter negates only `parts`). Examples: " +
+          "lessons with German subtitles in any localization: " +
+          "length(values(@)[?length(values(parts.subtitle || `{}`)[?de]) > `0`]); " +
+          "German subtitles in the DE localization: length(values(@)[?parts.subtitle.DE.de]); " +
+          "German subtitles not fully proofread: " +
+          "length(values(@)[?length(values(parts.subtitle || `{}`)[?de && de[1] < de[0]]) > `0`]); " +
+          "listed in the SE catalog but missing an SE/sv title, as codes: " +
+          "items(@)[?@[1].catalogs.SE && !(@[1].parts.title.SE.sv)] | map(&@[0], @); " +
+          "Swedish quiz text incomplete: " +
+          "length(values(@)[?totals.quiz_questions > `0` && (parts.quiz_text.XX.sv[0] || `0`) < totals.quiz_questions]).",
+      ),
+  },
+  async (args) => {
+    let doc: CoverageDocument;
+    try {
+      doc = (await get("lessons/content-coverage")) as CoverageDocument;
+    } catch (error) {
+      throw new Error(
+        `${error instanceof Error ? error.message : error}\nThe coverage endpoint is unavailable. Fall back to the legacy_* tools ` +
+          "(legacy_get_lesson_subtitle_urls, legacy_get_lesson_videos, legacy_get_lesson_titles) with " +
+          "all_lessons: true and a select.",
+      );
+    }
+    const status = (args.lesson_status as keyof typeof LESSON_STATUS_IDS | undefined) ?? "published";
+    const allowed: readonly number[] | null = LESSON_STATUS_IDS[status];
+    const lessons = Object.fromEntries(
+      Object.entries(doc.lessons).filter(([, lesson]) => !allowed || allowed.includes(lesson.status_id)),
+    );
+    const meta = { generated_at: doc.generated_at, lesson_status: status, lesson_count: Object.keys(lessons).length };
+
+    if (typeof args.select === "string") return { ...meta, result: search(lessons as never, args.select) };
+
+    // No select: describe the data instead of returning 7 MB that would be truncated anyway.
+    const [exampleCode, example] = Object.entries(lessons)[0] ?? [];
+    const partNames = [...new Set(Object.values(lessons).flatMap((l) => Object.keys((l.parts as object) ?? {})))];
+    return {
+      ...meta,
+      rules: doc.rules,
+      part_names: partNames.sort(),
+      example: exampleCode ? { [exampleCode]: example } : null,
+      next: "Call again with a select over the lessons map to get the answer.",
+    };
+  },
+  { ownSelect: true },
+);
 
 // Shared parameter shapes.
 const id = (what: string) => z.number().int().positive().describe(`The ${what} ID`);
@@ -316,7 +417,10 @@ const allLessonsScan = {
   all_lessons: z
     .boolean()
     .optional()
-    .describe("Query every lesson (batched; a cold scan can take minutes). Combine with select to get just the answer"),
+    .describe(
+      "Query every lesson (batched; a cold scan can take minutes). Combine with select. For counts and coverage, " +
+        "prefer get_content_coverage; use this for URLs/text or when get_content_coverage fails",
+    ),
   lesson_status_id: z
     .number()
     .int()

@@ -3,7 +3,7 @@
   "manifest_version": "0.3",
   "name": "content-api-mcp",
   "display_name": "Binogi Content API",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Ask questions about Binogi's lesson content: lessons, videos, subtitles, quizzes, concepts, learning outcomes and the catalog. Read-only.",
   "long_description": "Gives Claude read-only access to Binogi's content-api. Ask things like \"How many lessons have videos with German subtitles?\" or \"Which published lessons are missing a Swedish title?\". The extension can't create, change or delete content. Each question that triggers a tool call is logged locally to ~/.content-api-mcp/searchlog.jsonl on your computer.",
   "author": {
