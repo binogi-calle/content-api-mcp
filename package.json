@@ -1,6 +1,6 @@
 {
   "name": "content-api-mcp",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "description": "MCP server exposing Binogi content-api endpoints as tools",
   "type": "module",
@@ -9,7 +9,8 @@
   },
   "scripts": {
     "build": "node scripts/check-read-only.mjs && tsc",
-    "inspect": "npm run build && npx @modelcontextprotocol/inspector node dist/index.js"
+    "inspect": "npm run build && npx @modelcontextprotocol/inspector node dist/index.js",
+    "pack:mcpb": "node scripts/pack-mcpb.mjs"
   },
   "engines": {
     "node": ">=20.12"
@@ -20,6 +21,7 @@
     "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@anthropic-ai/mcpb": "2.1.2",
     "@types/node": "^26.6.6",
     "typescript": "^7.0.2"
   }

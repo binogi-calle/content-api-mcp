@@ -2,3 +2,5 @@ node_modules/
 dist/
 .env
 searchlog.jsonl
+build/
+*.mcpb

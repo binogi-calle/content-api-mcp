@@ -1,0 +1,52 @@
+{
+  "$schema": "https://raw.githubusercontent.com/anthropics/mcpb/main/schemas/mcpb-manifest-latest.schema.json",
+  "manifest_version": "0.3",
+  "name": "content-api-mcp",
+  "display_name": "Binogi Content API",
+  "version": "0.4.0",
+  "description": "Ask questions about Binogi's lesson content: lessons, videos, subtitles, quizzes, concepts, learning outcomes and the catalog. Read-only.",
+  "long_description": "Gives Claude read-only access to Binogi's content-api. Ask things like \"How many lessons have videos with German subtitles?\" or \"Which published lessons are missing a Swedish title?\". The extension can't create, change or delete content. Each question that triggers a tool call is logged locally to ~/.content-api-mcp/searchlog.jsonl on your computer.",
+  "author": {
+    "name": "Binogi"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/binogi-calle/content-api-mcp.git"
+  },
+  "server": {
+    "type": "node",
+    "entry_point": "dist/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/dist/index.js"],
+      "env": {
+        "CONTENT_API_URL": "${user_config.content_api_url}",
+        "CONTENT_API_KEY": "${user_config.content_api_key}",
+        "SEARCH_LOG_FILE": "~/.content-api-mcp/searchlog.jsonl"
+      }
+    }
+  },
+  "user_config": {
+    "content_api_key": {
+      "type": "string",
+      "title": "Content API key",
+      "description": "The api-key for the content-api environment below. Ask the content team for it; keep it private.",
+      "required": true,
+      "sensitive": true
+    },
+    "content_api_url": {
+      "type": "string",
+      "title": "Content API URL",
+      "description": "content-api base URL, including /api.",
+      "required": true,
+      "default": "https://qa-content.binogi.net/api"
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "win32"],
+    "runtimes": {
+      "node": ">=20.12.0"
+    }
+  },
+  "keywords": ["binogi", "content", "lessons", "read-only"]
+}

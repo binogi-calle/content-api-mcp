@@ -39,7 +39,16 @@ The server loads `.env` from its own folder, whichever directory a client launch
 
 ## Connect it
 
-### Claude desktop app
+### Claude desktop app: install the bundle (for users)
+
+1. Get `content-api-mcp-<version>.mcpb` and the content-api key from the team.
+2. Double-click the file. Claude opens an install dialog.
+3. Enter the **Content API key**. It's stored in the system keychain and shown masked. Keep **Content API URL** at the QA default unless told otherwise.
+4. In a new chat, check that "Binogi Content API" is enabled under "Search and tools".
+
+Node.js ships with the Claude desktop app; nothing else needs installing. Questions are logged to `~/.content-api-mcp/searchlog.jsonl` on the user's own computer (see [Question log](#question-log)).
+
+### Claude desktop app: from source (for developers)
 
 Add the server to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS), alongside any existing keys:
 
@@ -54,7 +63,7 @@ Add the server to `~/Library/Application Support/Claude/claude_desktop_config.js
 }
 ```
 
-Use the absolute path to `node` (`which node`): the app starts servers without your shell's `PATH`. Then quit the app completely (⌘Q) and reopen it. In a new chat, `content-api` appears under "Search and tools".
+Use the absolute path to `node` (`which node`): the app starts servers without your shell's `PATH`. Then quit the app completely (⌘Q) and reopen it. In a new chat, `content-api` appears under "Search and tools". Don't also install the bundle on the same machine, or Claude sees every tool twice.
 
 ### Claude Code
 
@@ -114,7 +123,7 @@ Each tool's description names its endpoint, for example `(GET /api/lessons/{code
 
 ## Question log
 
-Every tool call appends one line to `searchlog.jsonl` in the project root:
+Every tool call appends one line to the question log. The bundle writes to `~/.content-api-mcp/searchlog.jsonl` in the user's home folder, so it survives extension updates. When running from source, the log is `searchlog.jsonl` in the project root. `SEARCH_LOG_FILE` overrides the location, and a leading `~` means the home folder. Example line:
 
 ```json
 {"ts":"2026-11-05T01:21:21.855Z","question":"How many published lessons with Swedish titles do we have?","client":"claude-ai","tool":"legacy_get_lesson_titles","args":{"all_lessons":true,"lesson_status_id":2,"select":"…"},"ok":true,"durationMs":3371}
@@ -129,7 +138,7 @@ How the question gets there: an MCP server never sees the chat, only tool calls.
 - **`question` is `null`** when the client didn't pass it (for example, manual calls in the Inspector).
 - **The question appears in the tool call** that the chat app shows, and only in the log. It is never sent to content-api.
 
-The log is gitignored because it holds people's questions verbatim. It lives on the machine that runs the server.
+The log is gitignored because it holds people's questions verbatim. It lives on the machine that runs the server: with the bundle, that's each user's own computer, and the team only sees a user's questions if that user shares their log.
 
 ## Read-only guarantee
 
@@ -146,8 +155,27 @@ Read endpoints that use `POST` (such as `legacy/catalog/suggestedLessons`) are e
 src/index.ts          tools, all_lessons scan, select, output cap
 src/contentApi.ts     the only HTTP client: GET-only, .env loading, response cache
 src/searchLog.ts      question log
+manifest.json         .mcpb bundle manifest (install dialog, how the app starts the server)
 scripts/check-read-only.mjs   build-time read-only check
+scripts/pack-mcpb.mjs         builds the .mcpb bundle
 ```
+
+### Building the .mcpb bundle
+
+```bash
+npm run pack:mcpb
+```
+
+This produces `content-api-mcp-<version>.mcpb` in the project root (gitignored), ready to send to users. The script:
+
+1. checks that `manifest.json` and `package.json` have the same version (bump both for a release),
+2. runs `npm run build`, including the read-only check,
+3. copies only `manifest.json`, `package.json`, `package-lock.json`, `README.md` and `dist/` to `build/mcpb`, then installs production dependencies there (no dev tools, no `src/`, no `.env`),
+4. validates the manifest and packs the bundle with the pinned `@anthropic-ai/mcpb` CLI.
+
+`manifest.json` defines the install dialog (`user_config`: API key, marked sensitive and required; API URL, defaulting to QA) and passes the values to the server as `CONTENT_API_KEY` / `CONTENT_API_URL`.
+
+> **Every installed bundle needs the content-api key, and that key can also write.** Send the key separately from the bundle, and only to people who should have it. A hosted connector would keep the key on a server instead.
 
 ### Adding a tool
 

@@ -7,7 +7,7 @@ import { get, type Query } from "./contentApi.js";
 import { logSearch } from "./searchLog.js";
 
 const server = new McpServer(
-  { name: "content-api", version: "0.3.0" },
+  { name: "content-api", version: "0.4.0" },
   {
     instructions:
       "Read-only access to content-api. No tool can create, update or delete content.\n" +
